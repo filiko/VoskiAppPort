@@ -1,0 +1,228 @@
+Supporting a Phoenix-Style Self-Custody Lightning Wallet on Voltage
+Feasibility and Architecture Overview
+
+It is feasible to replicate a Phoenix-style non-custodial Lightning wallet using Voltage’s infrastructure. Voltage allows you to spin up Lightning nodes (LND or Core Lightning) with full API access
+voltage.cloud
+. This means you can programmatically manage channels, liquidity, and intercept payments as needed, treating the Voltage node as a Lightning Service Provider (LSP). The envisioned architecture is:
+
+Mobile Wallet (LDK-based): Runs Lightning Dev Kit (LDK) on-device, so all channel keys and signing remain on the user’s device (preserving self-custody). The mobile node has a single channel to the LSP (like Phoenix’s single channel to ACINQ) and uses BDK for on-chain funding.
+
+Voltage-hosted LSP Node: A cloud node (LND or CLN) that the wallet connects to as a peer. This node provides liquidity services (opening channels, inbound capacity) and routing assistance, without holding the user’s keys (non-custodial relationship). The LSP node can be managed via Voltage’s API using standard Lightning RPC calls
+voltage.cloud
+.
+
+Backend Services (Optional): You may implement a server (the “Voski” backend) to orchestrate LSP interactions, coordinate push notifications, and optionally mirror encrypted backups. This backend would use the Voltage node’s APIs (gRPC/REST) and additional services for vouchers or notifications as described.
+
+Outcome: This setup can deliver a Phoenix-like experience – instant channel creation, on-demand liquidity, and seamless UX – while the user retains full custody of funds (device-held keys) and channels are backed up for recovery. Below we detail how each requirement can be met with Voltage’s platform.
+
+Non-Custodial LSP Functions: Channel Creation & Liquidity
+
+To act as a non-custodial LSP, the Voltage node must handle channel management for the mobile wallets:
+
+Hosted Channel Creation: The LSP node can open channels to the user’s node on demand. Using LND’s API (or CLN’s RPC), you’d call the channel open method with appropriate parameters. In LND, this is OpenChannel – you specify the peer pubkey, funding amount, and you can mark the channel private
+lightning.engineering
+lightning.engineering
+. Similarly, Core Lightning’s fundchannel command supports an announce=false flag for private channels
+docs.corelightning.org
+. Private channels are recommended (like Phoenix) so they aren’t broadcast to the whole network.
+
+Inbound Liquidity Provisioning: To mirror Phoenix’s “zero-conf channel with inbound capacity,” the LSP opens the channel and pushes funds to the user’s side of the channel. Both LND and CLN support a push amount: in LND’s OpenChannel use the push_sat field
+lightning.engineering
+; in CLN’s fundchannel, use the push_msat parameter
+docs.corelightning.org
+. This push amount effectively gifts the user inbound liquidity at channel opening, so the user can immediately receive funds via that channel. (For example, ACINQ’s Phoenix LSP opens a channel and pushes a few thousand sats to the user, charging a small on-chain fee for this service.)
+
+“Zero-Conf”/Fast Channel Availability: Voltage’s LND nodes can be configured for zero-conf channels (e.g. set --protocol.optional-chan-enabled and use zero_conf=true when opening
+lightning.engineering
+lightning.engineering
+) if you want the channel usable instantly before confirmation, similar to Phoenix. This requires both sides to enable zero-conf; LND and CLN now support it (option_zeroconf) for trusted peers. Using it would allow immediate Lightning payments at the cost of some trust that the funding TX won’t be double-spent.
+
+Dynamic Liquidity Management: The LSP node can offer services like automatically opening a new channel or splicing in liquidity when the user’s inbound capacity is low. Voltage’s API gives full LND access, so you could listen for ChannelBalance or payment events and trigger OpenChannel (or dual-funding requests if using CLN’s liquidity ads). For instance, the wallet might call a backend API “ensure inbound liquidity” after a user receives funds, prompting the LSP node to open or enlarge a channel. This keeps the user’s inbound capacity sufficient for future receives.
+
+Non-Custodial Nature: In this model, the user’s LDK node holds its channel private keys and signs all channel updates. The Voltage LSP node only holds its own keys for its side of the channel. Thus, the LSP cannot unilaterally spend the user’s balance; it must cooperate in Lightning protocol or attempt a cheating close (which the user can counter with backups). This is exactly how Phoenix achieves self-custody – the channel is standard Lightning (2-of-2 multisig), with the user’s device and LSP each controlling their keys. The cloud node is simply providing a well-connected peer and funding, not custody of user funds.
+
+By leveraging Voltage’s node API, you can programmatically create and manage these channels as needed. For example, you might integrate a voucher funding flow (as in the Voski spec) where a user redeems a gift card via LNURL-withdraw; the backend then both pays the user’s invoice and opens a channel to the user for future payments. All of this can be done via standard LND/CLN RPC calls on the Voltage node.
+
+“Push-to-Wake” Offline Receiving (Asynchronous Payments)
+
+A hallmark of Phoenix is the ability to receive payments even if the app is closed (“just in time” push-to-wake for offline recipients). Implementing this on Voltage involves a combination of Lightning hold invoices/HTLC interception and push notifications:
+
+HTLC Interception / Hold Invoices: The LSP node can detect incoming payments destined for the offline user and temporarily hold them until the user comes online. LND provides the HtlcInterceptor streaming API for this purpose
+lightning.engineering
+. By running a small service or using LND’s Router RPC, the LSP can intercept any HTLC attempting to forward to the user’s node. Instead of immediately failing it when the user is offline, the LSP will hold the HTLC (unresolved) and not forward. Similarly, Core Lightning can achieve this via plugin hooks (htlc_accepted hook) or using hold invoices (where the LSP generates a BOLT11 invoice that it doesn’t settle immediately). The concept is the same: delay settlement.
+
+Push Notification to Wake the App: Once the LSP intercepts the payment, it needs to notify the user’s device to come online and finalize the payment. A common approach (used by Breez SDK and Phoenix) is for the LSP to call a webhook or notification service which in turn sends a push notification to the user’s phone
+stacker.news
+. The push contains an instruction for the wallet to wake up and connect to the Lightning network. In practice:
+
+Your backend stores each user’s device push token (for APNS/FCM) and maps it to their node/pubkey.
+
+When an incoming HTLC for that user is held at the LSP, the backend is informed (e.g. your interceptor service receives an event with the payment hash or custom record). The backend then sends a push notification to the device (“Lightning payment incoming – waking up to receive”).
+
+The mobile app, on receiving the push, wakes and brings up the LDK node (establishing a connection to the LSP peer). Once online, the user’s node can actually receive and settle the payment.
+
+Completing the Payment: After the app wakes, it will connect to the LSP and the LSP can now resume/forward the held HTLC. In LND’s interceptor API, your service would call ResolveHoldForward to either resume the HTLC to the user or fail it
+lightning.engineering
+. Now that the user node is online, the HTLC will reach it and the user’s LDK can supply the preimage to settle. From the sender’s perspective, the payment just took a bit longer, but completes once the user comes online and accepts the HTLC.
+
+Non-Custodial Guarantee: Importantly, this offline receive flow does not require the LSP to know the user’s secrets or hold their funds. The LSP is effectively acting as a temporary custodian of an HTLC, not of the settled funds. The actual preimage to claim the HTLC remains with the user’s wallet. If the user never comes online before the HTLC expiry, the payment will fail and revert to the sender (just as it would if Phoenix user never came online)
+voltage.cloud
+. This preserves self-custody: the LSP cannot steal the payment since it lacks the preimage, and the HTLC will refund if not redeemed.
+
+Timeout and UX: In practice, Lightning HTLCs have a timeout (expiry in a few blocks). Phoenix’s “just-in-time” setup brings the app online quickly enough to beat the timeout. You would aim to do the same – by sending push immediately and having the app auto-launch in the background, you can usually complete the receive within seconds
+forklog.com
+forklog.com
+. If the user is entirely offline (phone off or no internet), the payment will ultimately fail back to the sender (as Lightning normally requires receiver online). You should communicate this in the UI (“if offline too long, the payment won’t arrive”). In those edge cases, senders could fall back to on-chain or wait and retry.
+
+References & Tools: Lightning Labs’ hold invoices (available since LND 0.9) are a key enabler here. With AddHoldInvoice, an invoice can be created that doesn’t settle automatically
+voltage.cloud
+. The Breez SDK documentation confirms the above approach: the LSP calls a notification service when an incoming payment is at the last hop, and the client app wakes to receive
+stacker.news
+. This strategy allows async payments without degrading UX, aside from a short delay for the push. It’s a proven method used in production by Phoenix and Breez. Just note the trade-offs: while holding HTLCs, the LSP’s liquidity for that channel is locked (no other use of those funds)
+voltage.cloud
+, and if many HTLCs are held this could strain the LSP (Lightning imposes a limit of ~483 pending HTLCs per channel). In practice, most users won’t have dozens of concurrent incoming payments, so this is manageable.
+
+Channel State Data Access for Backup & Restore
+
+Ensuring full access to channel state data is crucial for an LDK-based wallet so that you can implement encrypted cloud backups and seed-based recovery. Fortunately, LDK is designed to give developers control over persistence:
+
+ChannelManager and ChannelMonitors: In an LDK node, the ChannelManager (which tracks overall state and on-chain logic) and each ChannelMonitor (which tracks a specific channel’s latest state for breach recovery) can be serialized to disk. As the developer, you provide LDK with a Persister interface that gets called whenever state changes. Voski’s design calls for serializing the ChannelManager and all ChannelMonitors after every channel update, encrypting them, and uploading to cloud storage. This ensures that every new commitment state is backed up.
+
+Encrypted Backups to User Cloud: The backup files (blobs) contain the necessary channel state to recover from loss of device. By encrypting them with a key derived from the user’s seed (for example, using HKDF on the BIP39 seed), you ensure that only the user can read their channel data – neither Voltage nor your own servers ever see plaintext channel info. The user’s iCloud/Google Drive acts as primary storage for these encrypted blobs, fulfilling the requirement that backups are user-controlled. Optionally, the Voski backend can mirror these blobs (still encrypted) on its server for redundancy. Since the server never has the decryption key, this does not compromise custody.
+
+Full Seed-Based Restore: To restore on a new device, the user enters their seed. The wallet derives the encryption key from seed, downloads the latest ChannelManager + ChannelMonitors backup set, and decrypts them. LDK can then be handed these objects to re-initialize the ChannelManager and resume channels exactly where they left off. The seed also lets you restore on-chain funds (BDK can derive the on-chain wallet). This means a user can fully recover their wallet (channels and on-chain) using just their 12 or 24-word seed plus the backup files. This is analogous to Phoenix’s approach: Phoenix’s seed words encrypt a static backup that ACINQ can use to close channels if needed. In our case, the user actually possesses the up-to-date state to avoid needing trust.
+
+Static Channel Backup (SCB) Fallback: In the rare case that the live state backups are lost (say the user’s cloud drive was not working), Voski’s plan includes a Static Channel Backup (SCB) fallback. An SCB is essentially a minimal record of the channel funding info that can be used to initiate force-closing the channel. LND provides an ExportChannelBackup (per channel) or ExportAllChannelBackups (for all channels) RPC
+lightning.engineering
+, and CLN has a staticbackup plugin/command
+docs.corelightning.org
+ for similar data. In practice, you might generate an SCB file or QR code when a channel opens and give it to the user (Phoenix users have an “Emergency Kit” PDF which is essentially an SCB). If the user loses all other data, they can feed the SCB into a recovery process. The SCB allows the Voltage LSP node to be instructed to close the channel on-chain. In LND’s case, if you attempt to restore an SCB, LND will cooperate by closing out to the user’s on-chain address. With static remote key channels (the default in new LN implementations), even if the user can’t talk to the LSP, the LSP’s unilateral close will send the user’s funds to a key derived from the user’s seed (static remotekey), which the user can then sweep on-chain. So either way, the seed ultimately allows fund recovery.
+
+Channel History and Data Visibility: The question of “channel history” being available refers to whether the user can access info like past states, TXIDs, etc. With your own LDK node, you have full logging of channel events. You can store additional metadata (payment history, channel open/close history) on-device or in backup if desired. None of this is hindered by using Voltage as the LSP, because the user’s node is still a first-class Lightning node (just mobile and mostly offline). The user’s node will see all its channel events when online and can record them. Voltage’s LSP node will have its own log of the channel, but that’s not needed for user backup.
+
+In summary, Voltage’s platform does not impede access to channel state; since the state lives in the LDK node, you control its persistence. The key is to implement robust backup logic in the mobile app, which the LDK architecture facilitates. By coupling this with the user’s seed for encryption, you achieve non-custodial yet safe storage. This meets the requirement of encrypted cloud backup and full seed-based restore.
+
+Private Channels & Network Graph Visibility
+
+Phoenix-style wallets typically use private channels to their LSP and don’t require the user to sync the entire Lightning network graph. We should clarify the implications:
+
+Routing with Private Channels: A private (unannounced) channel means other nodes won’t see it in the public gossip graph. Therefore, when the user wants to receive payments, they must provide route hints in their invoices. LDK (and BOLT11) supports this: the invoice will include the LSP node’s public key and the channel ID and fee info as a hint (r field). This tells payers “to reach me, route through [LSP] via this channel.” Phoenix does the same by including ACINQ’s node and the channel parameters in each invoice. This adds a bit of data to invoices but is generally not an issue. Performance-wise, private channels route just as efficiently as public ones once the payer knows about them via the hint. There’s no significant difference in payment speed; the payer will route to the LSP and then to the user.
+
+Sending Payments (Graph Visibility): For the user sending payments out, the user’s node needs some view of the network to find paths (unless it always routes out through the LSP as a first hop). Phoenix and Breez solve this by using trampoline or assisted pathfinding. In Phoenix’s case (using ACINQ’s Eclair), if the user’s node doesn’t have a full graph, it can use the LSP as a trampoline: essentially the user just routes the payment to the LSP and instructs the LSP to deliver it onward (the LSP has the full network view). LND doesn’t natively support trampoline, but you have options:
+
+Rapid Gossip Sync (RGS): Block’s LDK team introduced RGS specifically for mobile nodes. It allows a lightweight sync of the network graph from a server in a compressed snapshot
+lightningdevkit.org
+lightningdevkit.org
+. Your mobile wallet can fetch a daily (or frequent) graph snapshot from a semi-trusted service (perhaps your own server or an RGS service) to quickly update its knowledge of channels. This avoids the slow gossip sync and lets the phone compute routes privately. The trade-off is trusting the snapshot provider not to omit routes (which you can mitigate by hosting it yourself)
+lightningdevkit.org
+lightningdevkit.org
+. With RGS, the mobile node can know the network topology within a couple MB of data
+lightningdevkit.org
+, greatly speeding up route finding.
+
+QueryRoutes API / LSP Assistance: Another approach is to leverage LND’s QueryRoutes or a custom API on the backend: when the user wants to pay an invoice, the app can ask the LSP (or backend) for a route. This does sacrifice privacy (the LSP knows the destination), but in many user scenarios that may be acceptable (Phoenix’s trampoline reveals the payment destination to ACINQ as well). Voltage’s LND node has QueryRoutes and SendToRoute RPCs which could be used by your backend to compute and feed routes to the mobile node if needed
+lightning.engineering
+lightning.engineering
+.
+
+Trampoline/Multipath (future): Core Lightning and Eclair support trampoline and even offers (BOLT12). If you chose a CLN node as LSP, you could potentially use experimental BOLT12 offers or blinded paths to give the user a static identifier that others can pay without a new invoice each time. However, BOLT12 is not widely adopted yet. For now, BOLT11 invoices with route hints are the norm.
+
+Does private channels or partial graph knowledge limit recovery or performance? – Recovery: As discussed, recovery of funds does not require the channel to be public. If the user has the channel state (or SCB) and the seed, they can recover funds even if no one else knew about the channel. The only caveat is that with a private channel, if the user lost state and the LSP vanished, the user might not even know a channel existed unless they had a backup. But we already assume backups are in place. Public channels sometimes allow forensic recovery by scanning the blockchain for outputs to your keys, but since our backup scheme covers channel info, this isn’t needed. In short, private vs public has no impact on recovery if you handle backups. Performance: Private channels mean an extra routing hint step, but this is a constant overhead in the invoice. Once that’s provided, routing is as fast as normal. There is a slight limitation that spontaneous payments (keysend) to the user’s node won’t work when it’s offline or unknown – but Phoenix addresses that by having users share static Lightning addresses (which behind the scenes still provide route hints). So as long as the user is receiving via invoices or LNURL/Lightning Address (which can supply the hint), it’s fine. The user likely won’t be reachable for random payments without an invoice (which is a general Lightning limitation unless using something like offers).
+
+Channel Graph Incompleteness: It’s worth noting that running an LDK node on mobile often implies not being connected 24/7, so your node’s view of the network can get stale. Rapid Gossip Sync, as noted, mitigates this by letting you fetch a recent graph on demand
+lightningdevkit.org
+. Even if you didn’t use RGS, you could simply attempt payment and rely on LND’s Mission Control or error messages to try routes (LDK provides a routing API that can use partial info). But for best performance, using an up-to-date graph (via RGS) or delegating routing to the LSP for tricky payments will improve success rates. These are acceptable trade-offs for mobile nodes. In practice, Phoenix users rarely notice routing issues because the wallet and LSP coordinate to make it seamless.
+
+Conclusion for private channels: They are the standard for this model – they do not hinder the user’s ability to recover or operate, given the use of route hints and backups. Performance can be maintained using techniques like RGS or trampoline routing. Many modern mobile wallets (Phoenix, Breez, Zeus with Neutrino+RGS, etc.) operate with a partial or delegated graph view and achieve excellent success rates
+lightningdevkit.org
+.
+
+Voltage Node Configuration and API Support
+
+Using a Voltage-hosted node (LND or CLN) for the LSP role is straightforward and supported:
+
+Full LND API Exposure: Voltage nodes come with gRPC and REST endpoints that expose the complete LND API
+voltage.cloud
+. You authenticate with macaroons just as you would with a self-hosted LND. This means you can call openchannel, closechannel, addinvoice, payinvoice, exportchannelbackup, etc., directly. For example, you can programmatically open a channel with POST /v1/channels (REST) or the gRPC OpenChannel – including all relevant flags like private, push_amt, etc. The API gives you low-level control to automate channel management as your wallet requires.
+
+Core Lightning (CLN) Option: If you choose CLN, you will access it differently (likely through its JSON-RPC over WebSocket or via lightning-cli through Voltage’s interface). While Voltage documentation emphasizes LND, they do support Core Lightning nodes as well. CLN can be configured with plugins – for instance, you might install a plugin to handle htlc_accepted events to implement the hold-and-notify logic. Ensure the Voltage dashboard allows adding the plugin or that Voltage’s CLN nodes come with something like the Webhook plugin (a CLN plugin that sends webhook on certain events
+github.com
+). If not, you may lean toward LND, since LND’s built-in Router API covers what you need.
+
+Enabling Required Features: Whichever implementation, you’ll need to tweak some settings:
+
+For LND: Set --accept-keysend if you want to allow keysend (spontaneous payments) – not strictly needed for Phoenix model, but good to have. Ensure routerrpc is enabled (Voltage’s LND nodes typically have it by default, exposing HtlcInterceptor). You might also increase --max-htlc-in-flight or similar if you expect many concurrent holds, but default is usually fine. If using zero-conf, enable --protocol.option-zeroconf on both sides. Voltage likely has a UI toggle for keysend and others (their API example shows a JSON with "keysend": true in settings
+voltage.cloud
+).
+
+For CLN: Use config to allow large channels (--wumbo if needed) and announce-features to signal option_scid_alias/zeroconf if doing that. CLN now has a built-in REST API (via cln-rest plugin)
+docs.corelightning.org
+ which might simplify access. Ensure any plugin for hold invoices (like offer_invoice or a custom interceptor) is installed. This may require Voltage support, so it’s worth confirming with them if custom CLN plugins can be added by the user.
+
+Data Access via APIs: The “relevant data” you might need from the node includes things like channel funding information, on-chain addresses, invoice states, etc. LND’s API provides calls such as ListChannels, PendingChannels, and even a subscription to channel events (SubscribeChannelEvents)
+lightning.engineering
+. Through these, your backend can track when channels open/close to coordinate backups or user notifications. For instance, after calling OpenChannel, you can listen for the channel_active event to know when it’s ready, and then perhaps export an SCB (ExportChannelBackup) to give to the user
+lightning.engineering
+. You can also use SubscribeInvoices to be notified when a user’s invoice is paid (though in this model, the user’s invoices are mostly generated and fulfilled by the user’s LDK, not the LSP’s node, except for things like LNURL withdraws).
+
+Watchtowers and Security: Voltage’s LND supports watchtower clients. The user’s LDK node could run a watchtower or you could use the LSP as a watchtower. However, since we’re backing up state, the user can rely on just being online or using their backups to handle any closing. But for belt-and-suspenders, you might run an LDK-native watchtower or use a service like Tower and give it the user’s ChannelMonitor updates (still encrypted perhaps). This is optional; Phoenix does not rely on third-party watchtowers as far as known – it relies on the backup and LSP cooperation for channel close if user disappears.
+
+Monitoring and Logging: Voltage offers Surge (analytics tool) which can monitor node health and liquidity. This might help you ensure your LSP node has sufficient inbound capacity overall and is well-connected. Since all users channel to this node, it needs to have channels to the broader network. Ensure the LSP node has some liquidity outbound (either via channels or participating in Lightning Pool or loop-out from time to time) so it can route payments for users. Technically out-of-scope from an API perspective, but operationally important.
+
+Summary: You can configure a Voltage LND/CLN node to expose everything needed. You will treat it like a headless server node controlled via RPC. The model indeed is that the user’s keys live on the device, and the cloud node purely acts on API commands and its own keys for its role. This separation is clear and Voltage’s system doesn’t require any user key material to be uploaded – the user’s LDK never shares its seed or private keys with the LSP. All backup data sent to the backend is encrypted, as noted. Thus, the Voltage setup enables the non-custodial model with minimal friction.
+
+Limitations and Considerations
+
+Finally, a few limitations or nuances to be aware of in this design:
+
+HTLC Holding Trade-offs: Using hold invoices or intercepted HTLCs for offline receiving locks liquidity on the route and puts some burden on the LSP. If a user stays offline too long or never opens the app, the payment will fail and the funds return to sender after timeout. This isn’t a loss of funds, but could frustrate senders. In practice, educate users to open the app when expecting payments (the push notification will help). Also, limit how long you hold – you might configure your interceptor to give up after, say, 30 seconds if the user hasn’t come online, to avoid excessive HTLC timeouts. The Breez team noted that hold invoices don’t scale well if abused, effectively giving an interest-free loan to the recipient while held
+stacker.news
+voltage.cloud
+. In our use-case it’s short term, so it should be fine.
+
+Dependency on LSP Uptime: The user’s wallet is highly dependent on the LSP node (Voltage) being online and reachable. If the Voltage node goes down, the user cannot send/receive until it’s back (just like Phoenix depends on ACINQ’s node). Mitigate this by using Voltage’s reliability features (monitoring, maybe auto-restart on failure). If Voltage has an outage, users might need to wait or you might have a secondary LSP node as backup. The non-custodial nature is not affected (funds are safe with user), but availability is.
+
+Fees and Costs: Running an LSP node means you will bear on-chain fees for opening channels (typically passed to the user via some fee or spread). Phoenix, for example, deducts a small amount from initial inbound liquidity to cover the channel open fee. You’ll need to design a fee mechanism for channel opens, channel closing, and possibly a routing fee for payments going through the LSP. LND’s API lets you set custom channel policies (fee rates) per channel
+lightning.engineering
+. You might set a small fee rate on the user’s channel so that when you forward payments for them, you earn a bit (Phoenix charges ~0.1% on routing as an LSP fee).
+
+Channel Closure and Restore: If a user restores from seed without the latest state (e.g., using SCB because they lost all data), the SCB will trigger the LSP to force-close the channel. This results in on-chain outputs (with a to_local delay for the LSP’s funds). The user will get their funds on-chain after a timeout (maybe 1 day if it was LND with anchor outputs). This process is relatively seamless but not instant. Phoenix warns users that using the emergency kit (SCB) will close channels and incur on-chain fees/time. Make sure to document this for users. Normal restore with full backup avoids this, keeping channels open.
+
+Swappability of LSP: Voski’s principle is to keep the LSP integration pluggable. In practice, if you design your system to speak via standard APIs (LND or CLN RPC), you could swap out Voltage for another node (even self-hosted) or partner with multiple LSPs. This could allow the wallet to connect to different LSPs (perhaps user choice or geo-based). The main challenge is moving a user’s existing channel to a new LSP – that currently would require closing with old and opening with new. Future improvements in Lightning like channel splicing or liquidity transfers may make this smoother, but currently, each user is tied to the chosen LSP’s node pubkey for their channel.
+
+Core Lightning vs LND choice: LND is very feature-rich (especially with APIs, Pool, Loop, etc.) and is a safe choice given Voltage’s support. CLN is modular and has some advanced features (like offers, dual-funding leases, etc.) which could be beneficial long-term. For instance, CLN could let your users lease inbound liquidity via option_will_fund and request_amt
+docs.corelightning.org
+ (though that typically assumes your node is leasing to others; here you are the one providing liquidity). If you need AMP (multipath payments to combine on-chain and off-chain or send from multiple channels), LND’s API supports AMP invoices and payments. Evaluate which aligns better with your needs; fortunately, Voltage allows either, and the high-level design (user keys on device, encrypted backup, push-to-wake) can be achieved on both.
+
+Overall, with thoughtful configuration and use of Voltage’s APIs, you can deliver a Phoenix-like self-custodial Lightning wallet experience. The combination of LDK on mobile and a Voltage LSP node gives the best of both worlds: user-controlled funds with the convenience of an always-online service for liquidity and routing. By addressing liquidity, backup, and offline receiving as detailed above, you ensure the wallet “just works” without compromising on self-custody.
+
+Sources:
+
+Voltage documentation on node API access
+voltage.cloud
+ and hold invoices
+voltage.cloud
+, Voltage blog on hold invoice use cases
+voltage.cloud
+.
+
+LND API References for channel operations (push amount, private channel)
+lightning.engineering
+ and HTLC interception
+lightning.engineering
+. Core Lightning docs for push_msat and private channel (announce)
+docs.corelightning.org
+.
+
+Phoenix wallet behavior: Forklog news on Phoenix offline receive using push notifications
+forklog.com
+forklog.com
+; ACINQ’s “just-in-time wake up” explanation. Breez SDK blog on offline payments and notification webhooks
+stacker.news
+.
+
+Voski project brief (user files) describing the architecture and principles, including encrypted backup and push-to-wake design.
+
+Lightning Dev Kit documentation on Rapid Gossip Sync for quick graph updates on mobile
+lightningdevkit.org
+.
